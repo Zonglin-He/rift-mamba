@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
+
 
 def parse_time(value: Any) -> datetime | None:
     """Parse common timestamp representations into a timezone-naive datetime."""
@@ -30,3 +32,18 @@ def parse_time(value: Any) -> datetime | None:
 
 def days_between(later: datetime, earlier: datetime) -> float:
     return (later - earlier).total_seconds() / 86_400.0
+
+
+def fourier_time_features(
+    delta_days: float,
+    periods: tuple[float, ...] = (1.0, 7.0, 30.0, 365.0),
+) -> np.ndarray:
+    """Encode a relative time delta with sin/cos periodic features."""
+
+    features: list[float] = []
+    for period in periods:
+        if period <= 0:
+            raise ValueError("Fourier time periods must be positive")
+        angle = 2.0 * np.pi * delta_days / period
+        features.extend([float(np.sin(angle)), float(np.cos(angle))])
+    return np.asarray(features, dtype=np.float32)

@@ -20,10 +20,12 @@ from rift_mamba import (
     ForeignKey,
     RecordStore,
     RiftMambaModel,
-    RouteEnumerator,
+    TaskSpec,
+    AtomicRouteEnumerator,
     TableSchema,
     TaskRow,
     TemporalSequenceBuilder,
+    build_exclude_columns,
     build_basis,
 )
 
@@ -95,18 +97,27 @@ def main() -> None:
     ]
 
     store = RecordStore(schema, tables)
-    routes = RouteEnumerator(schema, max_hops=2).enumerate("customers")
+    task_spec = TaskSpec(
+        target_table="customers",
+        entity_column="customer_id",
+        seed_time_column="seed_time",
+        label_column="churn",
+        task_type="binary_classification",
+    )
+    routes = AtomicRouteEnumerator(schema, max_hops=2).enumerate("customers")
     basis = build_basis(
         schema,
         routes,
         BasisConfig(windows=(None, timedelta(days=30))),
+        exclude_columns=build_exclude_columns(task_spec, schema),
     )
 
     coeffs = CoefficientExtractor(store, basis).transform(tasks, target_table="customers")
-    coeffs = CoefficientStandardizer().fit_transform(coeffs)
+    scaler = CoefficientStandardizer().fit(coeffs)
+    coeffs = scaler.transform(coeffs)
 
     temporal_routes = tuple(route for route in routes if route.hop_count > 0)
-    sequences = TemporalSequenceBuilder(schema, store, temporal_routes, max_len=8).transform(
+    sequences = TemporalSequenceBuilder(schema, store, temporal_routes, max_len=8, value_embedding_dim=8).transform(
         tasks,
         target_table="customers",
     )
@@ -118,6 +129,8 @@ def main() -> None:
         event_dim=sequences.values.shape[-1],
         num_temporal_routes=len(temporal_routes),
         dropout=0.1,
+        basis_mode="cnn",
+        use_mamba_ssm=False,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 

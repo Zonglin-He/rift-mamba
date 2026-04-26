@@ -40,6 +40,7 @@ class ReachableRecord:
     route: SchemaRoute
     event_time: datetime | None
     path: tuple[tuple[str, Any], ...]
+    path_rows: tuple[tuple[str, Record], ...]
 
 
 class RecordStore:
@@ -102,14 +103,23 @@ class RecordStore:
             return ()
 
         start_key = (route.start_table, start.get(self.schema.table(route.start_table).primary_key))
-        states: list[tuple[Record, datetime | None, tuple[tuple[str, Any], ...]]] = [
-            (start, self._row_time(self.schema.table(route.start_table), start), (start_key,))
+        states: list[
+            tuple[Record, datetime | None, tuple[tuple[str, Any], ...], tuple[tuple[str, Record], ...]]
+        ] = [
+            (
+                start,
+                self._row_time(self.schema.table(route.start_table), start),
+                (start_key,),
+                ((route.start_table, start),),
+            )
         ]
 
         for step in route.steps:
             target_schema = self.schema.table(step.target_table)
-            new_states: list[tuple[Record, datetime | None, tuple[tuple[str, Any], ...]]] = []
-            for row, event_time, path in states:
+            new_states: list[
+                tuple[Record, datetime | None, tuple[tuple[str, Any], ...], tuple[tuple[str, Record], ...]]
+            ] = []
+            for row, event_time, path, path_rows in states:
                 join_value = row.get(step.source_column)
                 if join_value is None:
                     continue
@@ -120,7 +130,14 @@ class RecordStore:
                     candidate_time = self._row_time(target_schema, candidate)
                     next_event_time = _latest_time(event_time, candidate_time)
                     key = (step.target_table, candidate.get(target_schema.primary_key))
-                    new_states.append((candidate, next_event_time, path + (key,)))
+                    new_states.append(
+                        (
+                            candidate,
+                            next_event_time,
+                            path + (key,),
+                            path_rows + ((step.target_table, candidate),),
+                        )
+                    )
             states = new_states
             if not states:
                 return ()
@@ -139,8 +156,37 @@ class RecordStore:
                 route=route,
                 event_time=event_time,
                 path=path,
+                path_rows=path_rows,
             )
-            for row, event_time, path in states
+            for row, event_time, path, path_rows in states
+        )
+
+    def reachable_between(
+        self,
+        route: SchemaRoute,
+        task: TaskRow,
+        start_time: datetime | str,
+        end_time: datetime | str,
+        target_table: str | None = None,
+    ) -> tuple[ReachableRecord, ...]:
+        """Return rows with propagated event time in ``(start_time, end_time]``.
+
+        This is intended for future-window targets such as task-vector
+        pretraining. It should not be used to build supervised model inputs.
+        """
+
+        start = parse_time(start_time)
+        end = parse_time(end_time)
+        if start is None or end is None:
+            raise ValueError("start_time and end_time are required")
+        if end <= start:
+            raise ValueError("end_time must be later than start_time")
+        end_task = TaskRow(row_id=task.row_id, entity_id=task.entity_id, seed_time=end, label=task.label)
+        rows = self.reachable(route, end_task, target_table=target_table)
+        return tuple(
+            row
+            for row in rows
+            if row.event_time is not None and start < row.event_time <= end
         )
 
     def _row_time(self, table: TableSchema, row: Mapping[str, Any]) -> datetime | None:

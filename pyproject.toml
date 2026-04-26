@@ -12,6 +12,12 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+mamba = [
+  "mamba-ssm>=2.2",
+]
+relbench = [
+  "relbench",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

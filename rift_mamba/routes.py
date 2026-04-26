@@ -155,3 +155,42 @@ class RouteEnumerator:
             if fk.to_table == table_name:
                 steps.append(RouteStep(fk=fk, direction="backward"))
         return tuple(steps)
+
+
+class AtomicRouteEnumerator(RouteEnumerator):
+    """Enumerate bounded routes plus RelGNN-style atomic fact-table routes.
+
+    For a multi-FK fact/bridge table ``F`` with links to ``A``, ``B`` and ``C``,
+    starting at ``A`` this adds direct schema routes such as ``A <- F -> B`` and
+    ``A <- F -> C``. These routes become coefficient/signal units rather than
+    GNN message-passing edges.
+    """
+
+    def enumerate(self, start_table: str) -> tuple[SchemaRoute, ...]:
+        routes = list(super().enumerate(start_table))
+        seen = {route.name for route in routes}
+        for fact_table, links in self._multi_fk_tables().items():
+            start_links = [fk for fk in links if fk.to_table == start_table]
+            if not start_links:
+                continue
+            for start_fk in start_links:
+                first = RouteStep(fk=start_fk, direction="backward")
+                for other_fk in links:
+                    if other_fk == start_fk:
+                        fact_route = SchemaRoute(start_table, (first,))
+                        if fact_route.name not in seen and fact_route.hop_count <= self.max_hops:
+                            seen.add(fact_route.name)
+                            routes.append(fact_route)
+                        continue
+                    second = RouteStep(fk=other_fk, direction="forward")
+                    atomic = SchemaRoute(start_table, (first, second))
+                    if atomic.hop_count <= self.max_hops and atomic.name not in seen:
+                        seen.add(atomic.name)
+                        routes.append(atomic)
+        return tuple(routes)
+
+    def _multi_fk_tables(self) -> dict[str, tuple[ForeignKey, ...]]:
+        grouped: dict[str, list[ForeignKey]] = {}
+        for fk in self.schema.foreign_keys:
+            grouped.setdefault(fk.from_table, []).append(fk)
+        return {table: tuple(fks) for table, fks in grouped.items() if len(fks) >= 2}

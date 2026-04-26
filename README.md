@@ -1,45 +1,63 @@
 # RIFT-Mamba
 
-Reference prototype for **Relational Inverse Feature Transform with Route-wise Mamba**.
+Reference implementation for **RIFT-Mamba: Relational Inverse Feature Transform with Route-wise Mamba**.
 
-The code implements the idea as a leakage-safe relational prediction pipeline:
+The package turns relational databases into leakage-safe route signals:
 
 ```text
 RDB records
--> schema routes
--> causal reachable sets N_r(q)
+-> schema / atomic routes
+-> per-sample causal reachable paths
 -> relational coefficients alpha_b(q)
 -> learnable basis synthesis
--> basis Mamba + route-wise event Mamba
+-> route-slot dense signal or basis-token Mamba
+-> route-wise path event Mamba
 -> prediction head
 ```
 
-Core pieces:
+## Implemented Components
 
-- `rift_mamba.schema`: table, column, PK and FK metadata. PK/FK columns are connectivity metadata and are excluded from features.
-- `rift_mamba.routes`: bounded schema route enumeration with forward and backward PK-FK traversal.
-- `rift_mamba.records`: per-sample causal route traversal. Timestamped rows must satisfy `tau <= seed_time`.
-- `rift_mamba.basis`: basis generation with `b=(route,column,aggregation,window)`.
-- `rift_mamba.coefficients`: extraction of `alpha_b(q)` and missing-value masks.
-- `rift_mamba.nn`: learnable synthesis `m alpha Psi + (1-m) Omega`, literal sum mode, tokenized basis Mamba mode, route-wise temporal sequence encoder, and final fusion model.
+- `schema.py`: table, column, PK and FK metadata. PK/FK columns are connectivity metadata and are excluded from features.
+- `routes.py`: bounded route enumeration plus `AtomicRouteEnumerator` for fact/bridge tables such as `customer <- transaction -> product`.
+- `records.py`: per-sample causal traversal. Every timestamped row on a path must satisfy `tau <= seed_time`; windows are applied after the full path event time is known.
+- `basis.py` and `coefficients.py`: basis generation and extraction for `b=(route,column,aggregation,window)`, with alpha values and missing masks.
+- `semantic.py`: injectable schema/value semantic encoder. The default is deterministic hash text encoding; a frozen LLM/text encoder can implement the same interface.
+- `layout.py`: stable `route x slot x channel` dense tensor layout for CNN/TCN-style feature extractors.
+- `sequences.py`: path-aware route event tokens. Tokens include feature values from every row on the route path, categorical/text embedding vectors, Fourier time features, hop count, and route semantics.
+- `nn.py`: learnable synthesis `m alpha Psi + (1-m) Omega`, `basis_mode="sum"`, `basis_mode="mamba"`, `basis_mode="cnn"`, route-wise sequence encoder, and fusion head.
+- `task.py`: `TaskSpec`, automatic target/proxy leakage exclusion helpers, and train-split proxy leakage audit.
+- `pretraining.py`: TVE-style future task vector targets and cosine loss.
+- `adapters.py`, `experiment.py`, `baselines.py`: RelBench/materialized dataset adapter, train-only experiment preparation, built-in DFS MLP baseline, and external baseline wrappers for DFS LightGBM, GraphSAGE RDL, RelGNN, RelGT, RT, and Griffin.
 
-Run tests:
+## Run
 
 ```bash
 python -m pytest
-```
-
-Run the ecommerce demo:
-
-```bash
 python examples/ecommerce_churn_demo.py
 ```
 
-Important usage rule: every fact table with time semantics must declare its `timestamp` column in `TableSchema`. Otherwise no implementation can guarantee temporal leakage prevention for that table.
+Expected tests:
 
-The basis branch supports two forms:
+```text
+10 passed
+```
+
+## Basis Branch Modes
 
 - `basis_mode="sum"` computes the literal inverse-style signal `sum_b e_b(q)`.
-- `basis_mode="mamba"` keeps all basis terms as ordered tokens, including missing-basis tokens, and lets the basis Mamba learn higher-order interactions.
+- `basis_mode="mamba"` keeps all basis terms as ordered tokens, including missing-basis tokens.
+- `basis_mode="cnn"` scatters basis tokens into `[batch, routes, slots, channels]` and applies a CNN encoder.
 
-The temporal sequence builder encodes endpoint rows reached by each route, sorted by the route event time. Intermediate timestamped rows are still used for causal filtering and event-time propagation.
+## Leakage Rules
+
+1. Declare `timestamp` for every fact table with time semantics.
+2. Build inputs only from rows satisfying `tau <= seed_time`.
+3. Fit `CoefficientStandardizer` only on the train split, then transform validation/test.
+4. Use `TaskSpec` and `build_exclude_columns()` to remove target and known leakage columns.
+5. Run `audit_proxy_leakage()` on the train split for autocomplete-style targets.
+
+## RelBench and Baselines
+
+`RelBenchAdapter.from_materialized()` accepts already loaded tables, schema and task rows. This keeps the core code independent of RelBench release-specific object formats. For official RelBench/RelBench v2 objects, subclass the adapter or map them into `RelationalDatasetBundle`.
+
+Faithful RelGNN, RelGT, RT and Griffin comparisons should call their official repositories through `ExternalBaseline`; the registry names are provided by `default_baseline_registry()`.
