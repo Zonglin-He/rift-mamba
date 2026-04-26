@@ -1,0 +1,18 @@
+[project]
+name = "rift-mamba"
+version = "0.1.0"
+description = "RIFT-Mamba: relational inverse feature transform with route-wise sequence encoders."
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0",
+  "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
