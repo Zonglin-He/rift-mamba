@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Iterable
+from typing import Any, Iterable
 
 from rift_mamba.routes import SchemaRoute
 from rift_mamba.schema import ColumnKind, DatabaseSchema
@@ -55,6 +55,65 @@ class RelationalBasis:
         window = "all" if self.window is None else f"{int(self.window.total_seconds() // 86_400)}d"
         column = self.column_name or "__row__"
         return f"{self.route.name}|{column}|{self.aggregator}|{window}"
+
+
+@dataclass(frozen=True)
+class CompositeRelationalBasis:
+    """A path-conditional coefficient over two columns on the same route path."""
+
+    index: int
+    route: SchemaRoute
+    value_table: str
+    value_column: str
+    value_kind: ColumnKind | str
+    condition_table: str
+    condition_column: str
+    condition_kind: ColumnKind | str
+    aggregator: str
+    window: timedelta | None
+    condition_value: Any | None = None
+    value_occurrence: int = 0
+    condition_occurrence: int = 0
+
+    @property
+    def route_name(self) -> str:
+        return self.route.name
+
+    @property
+    def end_table(self) -> str:
+        return self.route.end_table
+
+    @property
+    def column_name(self) -> str:
+        condition = "*" if self.condition_value is None else str(self.condition_value)
+        return f"{self.value_table}.{self.value_column}|{self.condition_table}.{self.condition_column}={condition}"
+
+    @property
+    def column_kind(self) -> ColumnKind | str:
+        return self.value_kind
+
+    @property
+    def name(self) -> str:
+        window = "all" if self.window is None else f"{int(self.window.total_seconds() // 86_400)}d"
+        condition = "*" if self.condition_value is None else str(self.condition_value)
+        return (
+            f"{self.route.name}|{self.value_table}.{self.value_column}|"
+            f"{self.condition_table}.{self.condition_column}={condition}|{self.aggregator}|{window}"
+        )
+
+
+@dataclass(frozen=True)
+class CompositeBasisSpec:
+    route: SchemaRoute
+    value_table: str
+    value_column: str
+    condition_table: str
+    condition_column: str
+    aggregator: str
+    window: timedelta | None
+    condition_value: Any | None = None
+    value_occurrence: int = 0
+    condition_occurrence: int = 0
 
 
 def build_basis(
@@ -103,6 +162,45 @@ def build_basis(
                             window=window,
                         )
                     )
+    return tuple(bases)
+
+
+def build_composite_basis(
+    schema: DatabaseSchema,
+    specs: Iterable[CompositeBasisSpec],
+    start_index: int = 0,
+    exclude_columns: Iterable[tuple[str, str]] = (),
+) -> tuple[CompositeRelationalBasis, ...]:
+    """Build manual path-conditional bases from composite specs."""
+
+    excluded = set(exclude_columns)
+    bases: list[CompositeRelationalBasis] = []
+    for spec in specs:
+        value_column = schema.table(spec.value_table).column(spec.value_column)
+        condition_column = schema.table(spec.condition_table).column(spec.condition_column)
+        if (spec.value_table, spec.value_column) in excluded:
+            continue
+        if (spec.condition_table, spec.condition_column) in excluded:
+            continue
+        if not value_column.is_feature or not condition_column.is_feature:
+            continue
+        bases.append(
+            CompositeRelationalBasis(
+                index=start_index + len(bases),
+                route=spec.route,
+                value_table=spec.value_table,
+                value_column=spec.value_column,
+                value_kind=value_column.kind,
+                condition_table=spec.condition_table,
+                condition_column=spec.condition_column,
+                condition_kind=condition_column.kind,
+                aggregator=spec.aggregator,
+                window=spec.window,
+                condition_value=spec.condition_value,
+                value_occurrence=spec.value_occurrence,
+                condition_occurrence=spec.condition_occurrence,
+            )
+        )
     return tuple(bases)
 
 

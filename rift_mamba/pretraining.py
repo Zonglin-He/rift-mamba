@@ -20,9 +20,30 @@ from rift_mamba.records import RecordStore, TaskRow
 class TaskVectorTargets:
     values: np.ndarray
     masks: np.ndarray
+    null_indicators: np.ndarray
     bases: tuple[RelationalBasis, ...]
     task_rows: tuple[TaskRow, ...]
     horizon: timedelta
+
+    def training_matrix(self, include_null_indicator: bool = True) -> np.ndarray:
+        if include_null_indicator:
+            return np.concatenate([self.values, self.null_indicators.astype(np.float32)], axis=1)
+        return self.values
+
+    def training_mask(self, include_null_indicator: bool = True) -> np.ndarray:
+        if include_null_indicator:
+            return np.ones((self.values.shape[0], self.values.shape[1] * 2), dtype=bool)
+        return self.masks
+
+    def sample_weights(self, mode: str = "inverse_present") -> np.ndarray:
+        present = self.masks.sum(axis=1).astype(np.float32)
+        if mode == "none":
+            return np.ones_like(present, dtype=np.float32)
+        if mode == "inverse_present":
+            return 1.0 / np.maximum(present, 1.0)
+        if mode == "sqrt_inverse_present":
+            return 1.0 / np.sqrt(np.maximum(present, 1.0))
+        raise ValueError("unknown sample weight mode")
 
 
 class TaskVectorTargetBuilder:
@@ -51,7 +72,15 @@ class TaskVectorTargetBuilder:
                 value, present = aggregate_basis(rows, basis, end)
                 values[task_index, basis.index] = value
                 masks[task_index, basis.index] = present
-        return TaskVectorTargets(values=values, masks=masks, bases=self.bases, task_rows=tasks, horizon=self.horizon)
+        null_indicators = ~masks
+        return TaskVectorTargets(
+            values=values,
+            masks=masks,
+            null_indicators=null_indicators,
+            bases=self.bases,
+            task_rows=tasks,
+            horizon=self.horizon,
+        )
 
 
 class TaskVectorHead(nn.Module):
@@ -70,7 +99,12 @@ class TaskVectorHead(nn.Module):
         return self.net(features)
 
 
-def task_vector_cosine_loss(predicted: Tensor, target: Tensor, mask: Tensor | None = None) -> Tensor:
+def task_vector_cosine_loss(
+    predicted: Tensor,
+    target: Tensor,
+    mask: Tensor | None = None,
+    sample_weight: Tensor | None = None,
+) -> Tensor:
     """Cosine TVE loss over present future statistics."""
 
     if mask is not None:
@@ -78,4 +112,16 @@ def task_vector_cosine_loss(predicted: Tensor, target: Tensor, mask: Tensor | No
         predicted = predicted * mask_f
         target = target * mask_f
     cosine = F.cosine_similarity(predicted, target, dim=-1, eps=1e-8)
-    return (1.0 - cosine).mean()
+    loss = 1.0 - cosine
+    if mask is not None:
+        valid = mask.any(dim=-1)
+        loss = torch.where(valid, loss, torch.zeros_like(loss))
+    if sample_weight is not None:
+        weights = sample_weight.to(dtype=loss.dtype)
+        loss = loss * weights
+        denom = weights.sum().clamp_min(1e-8)
+        return loss.sum() / denom
+    if mask is not None:
+        denom = mask.any(dim=-1).to(dtype=loss.dtype).sum().clamp_min(1.0)
+        return loss.sum() / denom
+    return loss.mean()

@@ -111,6 +111,7 @@ class RouteEnumerator:
         max_hops: int = 3,
         allow_cycles: bool = False,
         include_self: bool = True,
+        skip_immediate_inverse: bool = True,
     ) -> None:
         if max_hops < 0:
             raise ValueError("max_hops must be non-negative")
@@ -118,6 +119,7 @@ class RouteEnumerator:
         self.max_hops = max_hops
         self.allow_cycles = allow_cycles
         self.include_self = include_self
+        self.skip_immediate_inverse = skip_immediate_inverse
 
     def enumerate(self, start_table: str) -> tuple[SchemaRoute, ...]:
         self.schema.table(start_table)
@@ -130,6 +132,8 @@ class RouteEnumerator:
             next_frontier: list[SchemaRoute] = []
             for route in frontier:
                 for step in self._next_steps(route.end_table):
+                    if self.skip_immediate_inverse and route.steps and _is_immediate_inverse(route.steps[-1], step):
+                        continue
                     step_identity = (
                         step.fk.from_table,
                         step.fk.from_column,
@@ -166,8 +170,16 @@ class AtomicRouteEnumerator(RouteEnumerator):
     GNN message-passing edges.
     """
 
+    def __init__(self, *args, atomic_only: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.atomic_only = atomic_only
+
     def enumerate(self, start_table: str) -> tuple[SchemaRoute, ...]:
-        routes = list(super().enumerate(start_table))
+        self.schema.table(start_table)
+        if self.atomic_only:
+            routes = [SchemaRoute(start_table)] if self.include_self else []
+        else:
+            routes = list(super().enumerate(start_table))
         seen = {route.name for route in routes}
         for fact_table, links in self._multi_fk_tables().items():
             start_links = [fk for fk in links if fk.to_table == start_table]
@@ -194,3 +206,7 @@ class AtomicRouteEnumerator(RouteEnumerator):
         for fk in self.schema.foreign_keys:
             grouped.setdefault(fk.from_table, []).append(fk)
         return {table: tuple(fks) for table, fks in grouped.items() if len(fks) >= 2}
+
+
+def _is_immediate_inverse(prev: RouteStep, step: RouteStep) -> bool:
+    return prev.fk == step.fk and prev.direction != step.direction

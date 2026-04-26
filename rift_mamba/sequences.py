@@ -56,6 +56,7 @@ class TemporalSequenceBuilder:
         semantic_encoder: SchemaSemanticEncoder | None = None,
         value_embedding_dim: int = 8,
         time_periods: tuple[float, ...] = (1.0, 7.0, 30.0, 365.0),
+        exclude_columns: Iterable[tuple[str, str]] = (),
     ) -> None:
         if max_len <= 0:
             raise ValueError("max_len must be positive")
@@ -68,7 +69,15 @@ class TemporalSequenceBuilder:
         self.semantic_encoder = semantic_encoder or SchemaSemanticEncoder()
         self.value_embedding_dim = value_embedding_dim
         self.time_periods = time_periods
-        self.event_columns = tuple(event_columns) if event_columns is not None else self._infer_event_columns()
+        self.exclude_columns = set(exclude_columns)
+        if event_columns is None:
+            self.event_columns = self._infer_event_columns()
+        else:
+            self.event_columns = tuple(
+                column
+                for column in event_columns
+                if (column.table, column.column) not in self.exclude_columns
+            )
 
     @property
     def event_dim(self) -> int:
@@ -113,6 +122,8 @@ class TemporalSequenceBuilder:
                 occurrences[table_name] = occurrence + 1
                 table = self.schema.table(table_name)
                 for column in table.feature_columns:
+                    if (table.name, column.name) in self.exclude_columns:
+                        continue
                     key = (table.name, column.name, occurrence)
                     if key in seen:
                         continue

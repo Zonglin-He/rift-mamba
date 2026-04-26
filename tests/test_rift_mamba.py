@@ -13,8 +13,10 @@ from rift_mamba import (
     CoefficientExtractor,
     CoefficientStandardizer,
     ColumnSchema,
+    CompositeBasisSpec,
     DatabaseSchema,
     ForeignKey,
+    InMemoryBackend,
     RecordStore,
     RelBenchAdapter,
     RelationalDatasetBundle,
@@ -23,6 +25,7 @@ from rift_mamba import (
     RiftMambaModel,
     RouteEnumerator,
     SchemaSemanticEncoder,
+    SentenceTransformerTextEncoder,
     TableSchema,
     TaskRow,
     TaskSpec,
@@ -30,10 +33,13 @@ from rift_mamba import (
     TemporalSequenceBuilder,
     audit_proxy_leakage,
     build_basis,
+    build_composite_basis,
     build_exclude_columns,
     prepare_experiment,
     ExperimentConfig,
+    task_vector_cosine_loss,
 )
+from rift_mamba.nn import MambaBlock
 from rift_mamba.time import fourier_time_features
 
 
@@ -107,6 +113,7 @@ def test_route_basis_excludes_pk_fk_and_keeps_routes() -> None:
     basis = build_basis(schema, routes, BasisConfig(windows=(None, timedelta(days=30))))
     assert all(basis_item.column_kind not in {"primary_key", "foreign_key"} for basis_item in basis)
     assert any(basis_item.route.table_path == ("customers", "transactions") for basis_item in basis)
+    assert not any(route.table_path == ("customers", "transactions", "customers") for route in routes)
 
 
 def test_schema_rejects_misdeclared_primary_key() -> None:
@@ -187,8 +194,11 @@ def test_sequence_builder_and_model_forward() -> None:
 def test_atomic_routes_generate_fact_bridge_routes() -> None:
     schema = make_schema()
     routes = AtomicRouteEnumerator(schema, max_hops=2).enumerate("customers")
+    atomic_only = AtomicRouteEnumerator(schema, max_hops=2, atomic_only=True).enumerate("customers")
 
     assert any(route.table_path == ("customers", "transactions", "products") for route in routes)
+    assert any(route.table_path == ("customers", "transactions", "products") for route in atomic_only)
+    assert not any(route.table_path == ("customers", "transactions", "customers") for route in atomic_only)
 
 
 def test_exclude_columns_leakage_audit_and_train_only_standardizer() -> None:
@@ -330,10 +340,33 @@ def test_path_aware_event_columns_preserve_repeated_table_occurrences() -> None:
 
 def test_prepare_experiment_runs_leakage_audit_and_relbench_materialized_adapter() -> None:
     schema = make_schema()
+    schema = DatabaseSchema.from_tables(
+        [
+            *schema.tables.values(),
+            TableSchema(
+                name="orders",
+                primary_key="order_id",
+                columns=(
+                    ColumnSchema("order_id", "primary_key", nullable=False),
+                    ColumnSchema("customer_id", "foreign_key"),
+                    ColumnSchema("payterms", "categorical"),
+                    ColumnSchema("proxy_payterms", "categorical"),
+                ),
+            ),
+        ],
+        [
+            *schema.foreign_keys,
+            ForeignKey("orders", "customer_id", "customers", "customer_id", role="order_customer"),
+        ],
+    )
     tables = {
         "customers": [
             {"customer_id": "c1", "age": 30, "region": "yes", "proxy": "yes"},
             {"customer_id": "c2", "age": 40, "region": "no", "proxy": "no"},
+        ],
+        "orders": [
+            {"order_id": "o1", "customer_id": "c1", "payterms": "net30", "proxy_payterms": "net30"},
+            {"order_id": "o2", "customer_id": "c2", "payterms": "cod", "proxy_payterms": "cod"},
         ],
         "transactions": [
             {"transaction_id": "t1", "customer_id": "c1", "product_id": "p1", "price": 10, "timestamp": "2023-01-01"},
@@ -362,5 +395,126 @@ def test_prepare_experiment_runs_leakage_audit_and_relbench_materialized_adapter
     )
 
     assert isinstance(bundle, RelationalDatasetBundle)
+    assert isinstance(bundle.coefficient_backend(), InMemoryBackend)
     assert any(finding.column == "proxy" for finding in train.leakage_findings)
-    assert all("proxy" not in name for name in train.coefficients.basis_names)
+    assert all("|proxy|" not in name for name in train.coefficients.basis_names)
+    assert all(column.column not in {"region", "proxy"} for column in train.sequences.event_columns)
+
+
+def test_sequence_builder_excludes_autocomplete_target_and_proxy_columns() -> None:
+    schema = make_schema()
+    store = make_store(schema)
+    routes = RouteEnumerator(schema, max_hops=1).enumerate("customers")
+    task = TaskSpec(
+        target_table="customers",
+        entity_column="customer_id",
+        seed_time_column="seed_time",
+        label_column="region",
+        task_type="autocomplete",
+        target_column=("customers", "region"),
+        leakage_columns=(("customers", "age"),),
+    )
+    seq = TemporalSequenceBuilder(
+        schema,
+        store,
+        routes,
+        max_len=4,
+        exclude_columns=build_exclude_columns(task, schema),
+    ).transform([TaskRow(0, "c1", "2023-01-15")], "customers")
+
+    assert all(column.column not in {"region", "age"} for column in seq.event_columns)
+
+
+def test_composite_path_basis_conditions_on_intermediate_path_values() -> None:
+    schema = make_schema()
+    store = make_store(schema)
+    routes = RouteEnumerator(schema, max_hops=2).enumerate("customers")
+    product_route = next(route for route in routes if route.table_path == ("customers", "transactions", "products"))
+    specs = (
+        CompositeBasisSpec(
+            route=product_route,
+            value_table="transactions",
+            value_column="price",
+            condition_table="products",
+            condition_column="category",
+            condition_value="electronics",
+            aggregator="group_mean",
+            window=timedelta(days=30),
+        ),
+    )
+    bases = build_composite_basis(schema, specs)
+    matrix = CoefficientExtractor(store, bases).transform([TaskRow(0, "c1", "2023-01-15")], "customers")
+
+    assert matrix.masks[0, 0]
+    assert matrix.values[0, 0] == 10.0
+
+
+def test_sentence_transformer_encoder_is_optional_and_mock_encoder_is_usable() -> None:
+    class MockEncoder:
+        dim = 3
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def encode(self, text: str) -> np.ndarray:
+            self.calls += 1
+            return np.ones(3, dtype=np.float32)
+
+    mock = MockEncoder()
+    encoder = SchemaSemanticEncoder(mock)
+    schema = make_schema()
+    routes = RouteEnumerator(schema, max_hops=0).enumerate("customers")
+    basis = build_basis(schema, routes, BasisConfig(windows=(None,)))
+
+    matrix = encoder.basis_matrix(basis)
+    assert matrix.shape == (len(basis), 3)
+    assert mock.calls == len(basis)
+    assert SentenceTransformerTextEncoder is not None
+
+
+def test_mamba_padding_diagnostics_and_exact_mask_are_padding_invariant() -> None:
+    block = MambaBlock(d_model=4, use_mamba_ssm=False, allow_masked_mamba=False)
+    x = torch.randn(2, 5, 4)
+    mask = torch.tensor([[False, False, True, True, True], [False, True, True, True, True]])
+    changed = x.clone()
+    changed[~mask] = 1.0e6
+
+    y1 = block(x, mask)
+    y2 = block(changed, mask)
+    assert block.implementation_name == "fallback_causal_gated_ssm"
+    assert torch.allclose(y1[mask], y2[mask], atol=1e-4)
+    assert torch.isfinite(block.masked_approximation_error(x, mask))
+
+
+def test_tve_loss_handles_null_indicators_empty_masks_and_reweighting() -> None:
+    schema = make_schema()
+    store = make_store(schema)
+    routes = RouteEnumerator(schema, max_hops=1).enumerate("customers")
+    txn_route = next(route for route in routes if route.table_path == ("customers", "transactions"))
+    mean_basis = (RelationalBasis(0, txn_route, "mean", None, "price", "numeric"),)
+    empty_targets = TaskVectorTargetBuilder(store, mean_basis, timedelta(days=1)).transform(
+        [TaskRow(0, "c1", "2023-01-15")],
+        "customers",
+    )
+
+    assert empty_targets.masks.tolist() == [[False]]
+    assert empty_targets.null_indicators.tolist() == [[True]]
+    assert empty_targets.training_matrix().tolist() == [[0.0, 1.0]]
+    assert empty_targets.training_mask().tolist() == [[True, True]]
+    assert empty_targets.sample_weights().tolist() == [1.0]
+
+    pred = torch.zeros(3, 4)
+    target = torch.zeros(3, 4)
+    mask = torch.zeros(3, 4, dtype=torch.bool)
+    loss = task_vector_cosine_loss(pred, target, mask)
+
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+
+    weighted = task_vector_cosine_loss(
+        torch.ones(2, 2),
+        torch.tensor([[1.0, 0.0], [1.0, 1.0]]),
+        torch.tensor([[True, False], [True, True]]),
+        sample_weight=torch.tensor([1.0, 0.5]),
+    )
+    assert torch.isfinite(weighted)

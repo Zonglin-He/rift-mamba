@@ -6,7 +6,7 @@ can inject a frozen LLM/text encoder by implementing the same ``encode`` method.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 import hashlib
 
@@ -47,6 +47,40 @@ class HashTextEncoder:
         if norm > 0:
             vector /= norm
         return vector
+
+
+@dataclass
+class SentenceTransformerTextEncoder:
+    """Optional frozen sentence-transformers encoder for schema semantics."""
+
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    normalize: bool = True
+    _model: object | None = field(default=None, init=False, repr=False)
+    _dim: int | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except Exception as exc:
+            raise ImportError(
+                "SentenceTransformerTextEncoder requires the optional 'sentence-transformers' package. "
+                "Install rift-mamba[text] or inject another TextEncoder."
+            ) from exc
+        self._model = SentenceTransformer(self.model_name)
+        dim = self._model.get_sentence_embedding_dimension()
+        self._dim = int(dim) if dim is not None else int(self.encode("dimension probe").shape[0])
+
+    @property
+    def dim(self) -> int:
+        if self._dim is None:
+            raise RuntimeError("SentenceTransformerTextEncoder is not initialized")
+        return self._dim
+
+    def encode(self, text: str) -> np.ndarray:
+        if self._model is None:
+            raise RuntimeError("SentenceTransformerTextEncoder is not initialized")
+        vector = self._model.encode(text, normalize_embeddings=self.normalize)
+        return np.asarray(vector, dtype=np.float32)
 
 
 class SchemaSemanticEncoder:

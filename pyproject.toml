@@ -18,6 +18,13 @@ mamba = [
 relbench = [
   "relbench",
 ]
+text = [
+  "sentence-transformers>=2.7",
+]
+backends = [
+  "duckdb>=1.0",
+  "polars>=1.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

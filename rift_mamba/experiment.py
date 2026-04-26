@@ -30,6 +30,7 @@ class ExperimentConfig:
     basis_config: BasisConfig = BasisConfig()
     auto_leakage_audit: bool = True
     leakage_threshold: float = 0.98
+    atomic_only: bool = False
 
 
 def prepare_experiment(
@@ -41,7 +42,14 @@ def prepare_experiment(
     """Build train/eval coefficients and sequences with train-only normalization."""
 
     enumerator_cls = AtomicRouteEnumerator if config.use_atomic_routes else RouteEnumerator
-    routes = enumerator_cls(bundle.schema, max_hops=config.max_hops).enumerate(bundle.task.target_table)
+    if config.use_atomic_routes:
+        routes = enumerator_cls(
+            bundle.schema,
+            max_hops=config.max_hops,
+            atomic_only=config.atomic_only,
+        ).enumerate(bundle.task.target_table)
+    else:
+        routes = enumerator_cls(bundle.schema, max_hops=config.max_hops).enumerate(bundle.task.target_table)
     exclude = set(build_exclude_columns(bundle.task, bundle.schema))
     leakage_findings: tuple[LeakageFinding, ...] = ()
     if config.auto_leakage_audit and bundle.task.label_column:
@@ -58,13 +66,20 @@ def prepare_experiment(
         )
         exclude.update((bundle.task.target_table, finding.column) for finding in leakage_findings)
     bases = build_basis(bundle.schema, routes, config.basis_config, exclude_columns=exclude)
-    store = bundle.record_store()
-    extractor = CoefficientExtractor(store, bases)
+    backend = bundle.coefficient_backend()
+    store = backend.record_store()
+    extractor = backend.coefficient_extractor(bases)
     train_coeffs = extractor.transform(train_rows, target_table=bundle.task.target_table)
     standardizer = CoefficientStandardizer().fit(train_coeffs)
     train_coeffs = standardizer.transform(train_coeffs)
     temporal_routes = tuple(route for route in routes if route.hop_count > 0)
-    sequence_builder = TemporalSequenceBuilder(bundle.schema, store, temporal_routes, max_len=config.sequence_max_len)
+    sequence_builder = TemporalSequenceBuilder(
+        bundle.schema,
+        store,
+        temporal_routes,
+        max_len=config.sequence_max_len,
+        exclude_columns=exclude,
+    )
     train_sequences = sequence_builder.transform(train_rows, target_table=bundle.task.target_table)
     train = PreparedExperiment(train_coeffs, train_sequences, standardizer, leakage_findings)
     if not eval_rows:

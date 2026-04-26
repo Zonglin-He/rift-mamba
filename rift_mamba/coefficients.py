@@ -10,7 +10,7 @@ import math
 
 import numpy as np
 
-from rift_mamba.basis import RelationalBasis
+from rift_mamba.basis import CompositeRelationalBasis, RelationalBasis
 from rift_mamba.records import ReachableRecord, RecordStore, TaskRow
 from rift_mamba.time import days_between, parse_time
 
@@ -72,6 +72,8 @@ def aggregate_basis(
 ) -> tuple[float, bool]:
     """Aggregate one basis for one task sample."""
 
+    if isinstance(basis, CompositeRelationalBasis):
+        return aggregate_composite_basis(rows, basis)
     if basis.aggregator == "count":
         return float(len(rows)), True
     if not rows or basis.column_name is None:
@@ -94,6 +96,47 @@ def aggregate_basis(
     if basis.column_kind == "datetime":
         return _aggregate_datetime(raw_values, rows, basis.aggregator, cutoff)
     return 0.0, False
+
+
+def aggregate_composite_basis(
+    rows: tuple[ReachableRecord, ...],
+    basis: CompositeRelationalBasis,
+) -> tuple[float, bool]:
+    """Aggregate a value column conditioned on another path column."""
+
+    pairs: list[tuple[float, ReachableRecord]] = []
+    for reachable in rows:
+        value_row = _path_row(reachable, basis.value_table, basis.value_occurrence)
+        condition_row = _path_row(reachable, basis.condition_table, basis.condition_occurrence)
+        if value_row is None or condition_row is None:
+            continue
+        condition = condition_row.get(basis.condition_column)
+        if basis.condition_value is not None and condition != basis.condition_value:
+            continue
+        value = value_row.get(basis.value_column)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isnan(number):
+            pairs.append((number, reachable))
+    agg = basis.aggregator.removeprefix("group_")
+    if agg == "rate":
+        agg = "mean"
+    if agg == "count":
+        return float(len(pairs)), True
+    return _aggregate_number_pairs(pairs, agg)
+
+
+def _path_row(reachable: ReachableRecord, table: str, occurrence: int) -> dict[str, Any] | None:
+    count = 0
+    for table_name, row in reachable.path_rows:
+        if table_name != table:
+            continue
+        if count == occurrence:
+            return row
+        count += 1
+    return None
 
 
 def _aggregate_numeric(values: list[Any], rows: tuple[ReachableRecord, ...], agg: str) -> tuple[float, bool]:

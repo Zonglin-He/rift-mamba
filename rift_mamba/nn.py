@@ -183,6 +183,25 @@ class MambaBlock(nn.Module):
             return self.dropout(y)  # type: ignore[attr-defined]
         return self.impl(x, mask)
 
+    @property
+    def implementation_name(self) -> str:
+        if self.uses_mamba_ssm:
+            return "mamba_ssm"
+        return "fallback_causal_gated_ssm"
+
+    def forward_exact_mask(self, x: Tensor, mask: Tensor) -> Tensor:
+        """Run the exact-mask fallback for diagnostics."""
+
+        return self.fallback(x, mask)
+
+    def masked_approximation_error(self, x: Tensor, mask: Tensor) -> Tensor:
+        """Compare current masked behavior against the exact-mask fallback."""
+
+        with torch.no_grad():
+            exact = self.forward_exact_mask(x, mask)
+            approx = self.forward(x, mask)
+            return (exact - approx).abs().max()
+
 
 class StackedMambaEncoder(nn.Module):
     def __init__(

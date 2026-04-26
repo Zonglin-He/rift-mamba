@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from rift_mamba.records import RecordStore, TaskRow
+from rift_mamba.backends import InMemoryBackend, make_backend
 from rift_mamba.schema import ColumnSchema, DatabaseSchema, ForeignKey, TableSchema
 from rift_mamba.task import TaskSpec
 
@@ -16,9 +17,13 @@ class RelationalDatasetBundle:
     tables: Mapping[str, Sequence[Mapping[str, Any]]]
     task_rows: tuple[TaskRow, ...]
     task: TaskSpec
+    backend: str = "materialized"
 
     def record_store(self) -> RecordStore:
         return RecordStore(self.schema, self.tables)
+
+    def coefficient_backend(self) -> InMemoryBackend:
+        return make_backend(self.backend, self.schema, self.tables)
 
 
 class RelBenchAdapter:
@@ -39,8 +44,17 @@ class RelBenchAdapter:
         tables: Mapping[str, Sequence[Mapping[str, Any]]],
         task_rows: Sequence[TaskRow],
         task: TaskSpec,
+        backend: str = "materialized",
     ) -> "RelBenchAdapter":
-        return cls(RelationalDatasetBundle(schema=schema, tables=tables, task_rows=tuple(task_rows), task=task))
+        return cls(
+            RelationalDatasetBundle(
+                schema=schema,
+                tables=tables,
+                task_rows=tuple(task_rows),
+                task=task,
+                backend=backend,
+            )
+        )
 
     @classmethod
     def from_relbench(cls, *args, **kwargs) -> "RelBenchAdapter":
@@ -62,12 +76,14 @@ class RelBenchAdapter:
         tables = _get_field(source, "tables")
         task_rows = _get_field(source, "task_rows")
         task = _get_field(source, "task")
+        backend = _get_field(source, "backend") or "materialized"
         if schema is not None and tables is not None and task_rows is not None and task is not None:
             return cls.from_materialized(
                 schema=_coerce_schema(schema),
                 tables=tables,
                 task_rows=tuple(_coerce_task_row(row) for row in task_rows),
                 task=_coerce_task_spec(task),
+                backend=backend,
             )
         try:
             import relbench  # type: ignore  # noqa: F401
