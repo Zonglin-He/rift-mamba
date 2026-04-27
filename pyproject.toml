@@ -11,6 +11,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+  "pandas>=2.0",
 ]
 mamba = [
   "mamba-ssm>=2.2",
@@ -23,9 +24,16 @@ text = [
 ]
 backends = [
   "duckdb>=1.0",
+  "pandas>=2.0",
   "polars>=1.0",
+]
+baselines = [
+  "lightgbm>=4.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["rift_mamba*"]

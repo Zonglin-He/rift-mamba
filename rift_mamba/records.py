@@ -32,6 +32,24 @@ class TaskRow:
 
 
 @dataclass(frozen=True)
+class LinkTaskRow:
+    """A link prediction sample q=(src, dst, seed_time, label)."""
+
+    row_id: str | int
+    src_id: Any
+    dst_id: Any
+    seed_time: datetime | str
+    label: Any = 1
+
+    @property
+    def cutoff(self) -> datetime:
+        parsed = parse_time(self.seed_time)
+        if parsed is None:
+            raise ValueError("link task seed_time cannot be None")
+        return parsed
+
+
+@dataclass(frozen=True)
 class ReachableRecord:
     """One row reached by a schema route for a single task sample."""
 

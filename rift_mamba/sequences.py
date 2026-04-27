@@ -37,6 +37,8 @@ class SequenceBatch:
     routes: tuple[SchemaRoute, ...]
     event_columns: tuple[EventColumn, ...]
     task_rows: tuple[TaskRow, ...]
+    standardize_feature_indices: tuple[int, ...] = ()
+    standardize_present_indices: tuple[int, ...] = ()
 
     @property
     def shape(self) -> tuple[int, int, int, int]:
@@ -110,7 +112,37 @@ class TemporalSequenceBuilder:
             routes=self.routes,
             event_columns=self.event_columns,
             task_rows=tasks,
+            standardize_feature_indices=self.standardize_feature_indices,
+            standardize_present_indices=self.standardize_present_indices,
         )
+
+    @property
+    def standardize_feature_indices(self) -> tuple[int, ...]:
+        """Event-token dimensions whose scale should be learned from train data."""
+
+        per_column = 2 + self.value_embedding_dim
+        indices: list[int] = []
+        for column_index, event_column in enumerate(self.event_columns):
+            if event_column.kind in {"numeric", "datetime"}:
+                indices.append(per_column * column_index)
+        base = len(self.event_columns) * per_column
+        indices.append(base)
+        return tuple(indices)
+
+    @property
+    def standardize_present_indices(self) -> tuple[int, ...]:
+        """Presence-flag dimensions paired with ``standardize_feature_indices``.
+
+        ``-1`` means the route event mask itself is the presence indicator.
+        """
+
+        per_column = 2 + self.value_embedding_dim
+        indices: list[int] = []
+        for column_index, event_column in enumerate(self.event_columns):
+            if event_column.kind in {"numeric", "datetime"}:
+                indices.append(per_column * column_index + per_column - 1)
+        indices.append(-1)
+        return tuple(indices)
 
     def _infer_event_columns(self) -> tuple[EventColumn, ...]:
         seen: set[tuple[str, str, int]] = set()

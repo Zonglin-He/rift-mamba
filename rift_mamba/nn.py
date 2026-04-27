@@ -357,6 +357,7 @@ class RiftMambaModel(nn.Module):
                 allow_masked_mamba=allow_masked_mamba,
             )
             fusion_dim += d_model
+        self.feature_dim = fusion_dim
         self.head = nn.Sequential(
             nn.LayerNorm(fusion_dim),
             nn.Linear(fusion_dim, d_model),
@@ -371,7 +372,23 @@ class RiftMambaModel(nn.Module):
         alpha_mask: Tensor,
         events: Tensor | None = None,
         event_mask: Tensor | None = None,
+        return_features: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        features = self.encode(alpha, alpha_mask, events=events, event_mask=event_mask)
+        logits = self.head(features)
+        if return_features:
+            return logits, features
+        return logits
+
+    def encode(
+        self,
+        alpha: Tensor,
+        alpha_mask: Tensor,
+        events: Tensor | None = None,
+        event_mask: Tensor | None = None,
     ) -> Tensor:
+        """Return fused RIFT-Mamba features before the prediction head."""
+
         basis_tokens = self.basis_synthesizer(alpha, alpha_mask)
         if self.basis_mode == "sum":
             h_basis = self.sum_norm(basis_tokens.sum(dim=1))
@@ -392,7 +409,7 @@ class RiftMambaModel(nn.Module):
             if events is None or event_mask is None:
                 raise ValueError("events and event_mask are required when sequence_encoder is enabled")
             pieces.append(self.sequence_encoder(events, event_mask))
-        return self.head(torch.cat(pieces, dim=-1))
+        return torch.cat(pieces, dim=-1)
 
 
 def masked_mean(x: Tensor, mask: Tensor) -> Tensor:

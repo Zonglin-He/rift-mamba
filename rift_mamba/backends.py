@@ -8,6 +8,7 @@ from typing import Mapping, Protocol, Sequence, Any
 from rift_mamba.coefficients import CoefficientExtractor, CoefficientMatrix
 from rift_mamba.records import RecordStore, TaskRow
 from rift_mamba.schema import DatabaseSchema
+from rift_mamba.sql import DuckDBCoefficientExtractor, PolarsCoefficientExtractor
 
 
 class CoefficientBackend(Protocol):
@@ -33,7 +34,7 @@ class InMemoryBackend:
 
 
 class DuckDBBackend(InMemoryBackend):
-    """DuckDB boundary for large-table materialization and future SQL pushdown."""
+    """DuckDB backend with SQL pushdown for supported coefficient bases."""
 
     name = "duckdb"
 
@@ -44,9 +45,12 @@ class DuckDBBackend(InMemoryBackend):
             raise ImportError("DuckDBBackend requires optional dependency duckdb; install rift-mamba[backends].") from exc
         super().__init__(schema=schema, tables=tables, name="duckdb")
 
+    def coefficient_extractor(self, bases) -> DuckDBCoefficientExtractor:
+        return DuckDBCoefficientExtractor(self.schema, self.tables, bases)
+
 
 class PolarsBackend(InMemoryBackend):
-    """Polars boundary for columnar preprocessing before coefficient extraction."""
+    """Polars backend with lazy DataFrame pushdown for supported bases."""
 
     name = "polars"
 
@@ -56,6 +60,9 @@ class PolarsBackend(InMemoryBackend):
         except Exception as exc:
             raise ImportError("PolarsBackend requires optional dependency polars; install rift-mamba[backends].") from exc
         super().__init__(schema=schema, tables=tables, name="polars")
+
+    def coefficient_extractor(self, bases) -> PolarsCoefficientExtractor:
+        return PolarsCoefficientExtractor(self.schema, self.tables, bases)
 
 
 def make_backend(

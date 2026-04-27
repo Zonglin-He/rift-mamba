@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import timedelta
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from rift_mamba import (
     BasisConfig,
@@ -15,8 +17,15 @@ from rift_mamba import (
     ColumnSchema,
     CompositeBasisSpec,
     DatabaseSchema,
+    DuckDBBackend,
+    EventFeatureStandardizer,
     ForeignKey,
     InMemoryBackend,
+    LinkExperimentConfig,
+    LinkRiftDataset,
+    LinkTaskRow,
+    PairRiftMambaModel,
+    PolarsBackend,
     RecordStore,
     RelBenchAdapter,
     RelationalDatasetBundle,
@@ -29,15 +38,20 @@ from rift_mamba import (
     TableSchema,
     TaskRow,
     TaskSpec,
+    TaskVectorHead,
     TaskVectorTargetBuilder,
     TemporalSequenceBuilder,
     audit_proxy_leakage,
     build_basis,
     build_composite_basis,
     build_exclude_columns,
+    audit_route_proxy_leakage,
+    prepare_link_experiment,
+    sample_negative_links,
     prepare_experiment,
     ExperimentConfig,
     task_vector_cosine_loss,
+    train_epoch,
 )
 from rift_mamba.nn import MambaBlock
 from rift_mamba.time import fourier_time_features
@@ -148,6 +162,42 @@ def test_causal_coefficients_exclude_future_and_apply_window_after_full_route() 
     assert matrix.values[0, 3] == 2.0
 
 
+def test_duckdb_backend_pushdown_matches_in_memory_coefficients() -> None:
+    schema = make_schema()
+    store = make_store(schema)
+    routes = RouteEnumerator(schema, max_hops=2).enumerate("customers")
+    basis = build_basis(schema, routes, BasisConfig(windows=(None, timedelta(days=30))))
+    tasks = (
+        TaskRow(row_id=0, entity_id="c1", seed_time="2023-01-15"),
+        TaskRow(row_id=1, entity_id="c1", seed_time="2023-02-15"),
+    )
+
+    memory = CoefficientExtractor(store, basis).transform(tasks, target_table="customers")
+    duckdb = DuckDBBackend(schema, store.tables).coefficient_extractor(basis).transform(tasks, target_table="customers")
+
+    assert duckdb.basis_names == memory.basis_names
+    assert np.allclose(duckdb.values, memory.values, atol=1e-5)
+    assert np.array_equal(duckdb.masks, memory.masks)
+
+
+def test_polars_backend_pushdown_matches_in_memory_coefficients() -> None:
+    schema = make_schema()
+    store = make_store(schema)
+    routes = RouteEnumerator(schema, max_hops=2).enumerate("customers")
+    basis = build_basis(schema, routes, BasisConfig(windows=(None, timedelta(days=30))))
+    tasks = (
+        TaskRow(row_id=0, entity_id="c1", seed_time="2023-01-15"),
+        TaskRow(row_id=1, entity_id="c1", seed_time="2023-02-15"),
+    )
+
+    memory = CoefficientExtractor(store, basis).transform(tasks, target_table="customers")
+    polars = PolarsBackend(schema, store.tables).coefficient_extractor(basis).transform(tasks, target_table="customers")
+
+    assert polars.basis_names == memory.basis_names
+    assert np.allclose(polars.values, memory.values, atol=1e-5)
+    assert np.array_equal(polars.masks, memory.masks)
+
+
 def test_last_aggregation_ignores_missing_without_misaligned_times() -> None:
     schema = make_schema()
     store = make_store(schema)
@@ -189,6 +239,35 @@ def test_sequence_builder_and_model_forward() -> None:
 
     assert logits.shape == (1, 2)
     assert torch.isfinite(logits).all()
+
+
+def test_event_feature_standardizer_uses_train_sequence_statistics() -> None:
+    schema = make_schema()
+    store = make_store(schema)
+    routes = RouteEnumerator(schema, max_hops=1).enumerate("customers")
+    txn_route = next(route for route in routes if route.table_path == ("customers", "transactions"))
+    builder = TemporalSequenceBuilder(schema, store, (txn_route,), max_len=4, value_embedding_dim=0)
+    train_task = TaskRow(row_id=0, entity_id="c1", seed_time="2023-01-15")
+    eval_task = TaskRow(row_id=1, entity_id="c1", seed_time="2023-02-15")
+    train_seq = builder.transform([train_task], target_table="customers")
+    eval_seq = builder.transform([eval_task], target_table="customers")
+
+    standardizer = EventFeatureStandardizer().fit(train_seq)
+    train_scaled = standardizer.transform(train_seq)
+    eval_scaled = standardizer.transform(eval_seq)
+
+    price_index = next(
+        index for index, column in enumerate(train_seq.event_columns) if column.name == "transactions.price"
+    ) * 2
+    price_offset = standardizer.feature_indices.index(price_index)
+    train_present = train_seq.masks & (train_seq.values[..., price_index + 1] > 0.5)
+    raw_eval_price = eval_seq.values[..., price_index][eval_seq.values[..., price_index] == 20.0][0]
+    scaled_eval_price = eval_scaled.values[..., price_index][eval_seq.values[..., price_index] == 20.0][0]
+
+    assert np.isclose(train_scaled.values[..., price_index][train_present].mean(), 0.0)
+    assert scaled_eval_price == pytest.approx(
+        (raw_eval_price - standardizer.mean_[price_offset]) / standardizer.scale_[price_offset]
+    )
 
 
 def test_atomic_routes_generate_fact_bridge_routes() -> None:
@@ -263,6 +342,7 @@ def test_cnn_layout_and_semantic_basis_encoder_forward() -> None:
     basis = build_basis(schema, routes, BasisConfig(windows=(None,)))
     coeffs = CoefficientExtractor(store, basis).transform([TaskRow(0, "c1", "2023-01-15")], "customers")
     layout = BasisLayout.from_bases(basis)
+    reversed_layout = BasisLayout.from_bases(tuple(reversed(basis)))
     model = RiftMambaModel(
         bases=basis,
         d_model=16,
@@ -280,6 +360,8 @@ def test_cnn_layout_and_semantic_basis_encoder_forward() -> None:
     logits = model(torch.from_numpy(coeffs.values).float(), torch.from_numpy(coeffs.masks).bool())
 
     assert dense.shape[:3] == (1, layout.num_routes, layout.num_slots)
+    assert reversed_layout.route_names == layout.route_names
+    assert reversed_layout.slots == layout.slots
     assert logits.shape == (1, 2)
 
 
@@ -305,6 +387,54 @@ def test_task_vector_targets_and_dataset_alignment() -> None:
     )
     with pytest.raises(ValueError, match="align"):
         RiftDataset(coeffs, sequences=wrong_seq)
+
+
+def test_model_encode_and_tve_training_epoch() -> None:
+    schema = make_schema()
+    store = make_store(schema)
+    routes = RouteEnumerator(schema, max_hops=1).enumerate("customers")
+    txn_route = next(route for route in routes if route.table_path == ("customers", "transactions"))
+    bases = (RelationalBasis(0, txn_route, "count", None),)
+    tasks = (
+        TaskRow(0, "c1", "2023-01-15", label=1),
+        TaskRow(1, "c1", "2023-02-15", label=0),
+    )
+    coeffs = CoefficientExtractor(store, bases).transform(tasks, "customers")
+    seq = TemporalSequenceBuilder(schema, store, (txn_route,), max_len=4).transform(tasks, "customers")
+    targets = TaskVectorTargetBuilder(store, bases, timedelta(days=45)).transform(tasks, "customers")
+    dataset = RiftDataset(coeffs, sequences=seq, task_vector_targets=targets)
+    loader = DataLoader(dataset, batch_size=2)
+    model = RiftMambaModel(
+        bases=bases,
+        d_model=8,
+        output_dim=2,
+        basis_layers=1,
+        event_dim=seq.values.shape[-1],
+        num_temporal_routes=1,
+        sequence_layers=1,
+        use_mamba_ssm=False,
+    )
+    head = TaskVectorHead(model.feature_dim, targets.training_matrix().shape[1])
+    optimizer = torch.optim.Adam([*model.parameters(), *head.parameters()], lr=1.0e-3)
+
+    features = model.encode(
+        torch.from_numpy(coeffs.values).float(),
+        torch.from_numpy(coeffs.masks).bool(),
+        torch.from_numpy(seq.values).float(),
+        torch.from_numpy(seq.masks).bool(),
+    )
+    metrics = train_epoch(
+        model,
+        loader,
+        optimizer,
+        torch.nn.CrossEntropyLoss(),
+        task_vector_head=head,
+        task_vector_weight=0.1,
+    )
+
+    assert features.shape == (2, model.feature_dim)
+    assert metrics.num_batches == 1
+    assert np.isfinite(metrics.loss)
 
 
 def test_path_aware_event_columns_preserve_repeated_table_occurrences() -> None:
@@ -399,6 +529,164 @@ def test_prepare_experiment_runs_leakage_audit_and_relbench_materialized_adapter
     assert any(finding.column == "proxy" for finding in train.leakage_findings)
     assert all("|proxy|" not in name for name in train.coefficients.basis_names)
     assert all(column.column not in {"region", "proxy"} for column in train.sequences.event_columns)
+
+
+def test_route_proxy_leakage_audit_finds_cross_table_proxy() -> None:
+    schema = make_schema()
+    schema = DatabaseSchema.from_tables(
+        [
+            *schema.tables.values(),
+            TableSchema(
+                name="orders",
+                primary_key="order_id",
+                columns=(
+                    ColumnSchema("order_id", "primary_key", nullable=False),
+                    ColumnSchema("customer_id", "foreign_key"),
+                    ColumnSchema("proxy_payterms", "categorical"),
+                ),
+            ),
+        ],
+        [
+            *schema.foreign_keys,
+            ForeignKey("orders", "customer_id", "customers", "customer_id", role="order_customer"),
+        ],
+    )
+    store = RecordStore(
+        schema,
+        {
+            "customers": [{"customer_id": "c1", "age": 30, "region": "east"}, {"customer_id": "c2", "age": 40, "region": "west"}],
+            "orders": [
+                {"order_id": "o1", "customer_id": "c1", "proxy_payterms": "net30"},
+                {"order_id": "o2", "customer_id": "c2", "proxy_payterms": "cod"},
+            ],
+            "transactions": [],
+            "products": [],
+        },
+    )
+    routes = RouteEnumerator(schema, max_hops=1).enumerate("customers")
+    findings = audit_route_proxy_leakage(
+        store,
+        schema,
+        routes,
+        [TaskRow(0, "c1", "2023-01-01", "net30"), TaskRow(1, "c2", "2023-01-01", "cod")],
+        target_table="customers",
+        exclude_columns={("customers", "region")},
+    )
+
+    assert any(finding.table == "orders" and finding.column == "proxy_payterms" for finding in findings)
+
+
+def test_relbench_official_object_adapter_maps_entity_and_splits() -> None:
+    class FakeTable:
+        def __init__(self, df, pkey_col=None, time_col=None, fkeys=None):
+            self.df = df
+            self.pkey_col = pkey_col
+            self.time_col = time_col
+            self.fkey_col_to_pkey_table = fkeys or {}
+
+    class FakeDB:
+        table_dict = {
+            "users": FakeTable(
+                pd.DataFrame({"user_id": [0, 1], "created_at": pd.to_datetime(["2023-01-01", "2023-01-02"]), "age": [10, 20]}),
+                pkey_col="user_id",
+                time_col="created_at",
+            )
+        }
+
+    class FakeDataset:
+        val_timestamp = pd.Timestamp("2023-02-01")
+        test_timestamp = pd.Timestamp("2023-03-01")
+
+        def get_db(self, upto_test_timestamp=True):
+            return FakeDB()
+
+    class FakeTask:
+        entity_table = "users"
+        entity_col = "user_id"
+        time_col = "seed_time"
+        target_col = "label"
+        task_type = "binary_classification"
+        timedelta = pd.Timedelta(days=1)
+
+        def get_table(self, split, mask_input_cols=None):
+            df = pd.DataFrame(
+                {
+                    "seed_time": pd.to_datetime(["2023-01-10"]),
+                    "user_id": [0],
+                    "label": [1],
+                }
+            )
+            if mask_input_cols:
+                df = df[["seed_time", "user_id"]]
+            return FakeTable(df, time_col="seed_time", fkeys={"user_id": "users"})
+
+    bundle = RelBenchAdapter.from_relbench_objects(FakeDataset(), FakeTask(), include_test_labels=True).load()
+
+    assert bundle.task.target_table == "users"
+    assert bundle.split_rows["train"][0].entity_id == 0
+    assert bundle.split_rows["test"][0].label == 1
+
+
+def test_link_prediction_preparation_pair_model_and_negative_sampling() -> None:
+    schema = make_schema()
+    store = make_store(schema)
+    task = TaskSpec(
+        target_table="customers",
+        entity_column="customer_id",
+        seed_time_column="seed_time",
+        label_column="product_id",
+        task_type="link_prediction",
+        src_entity_table="customers",
+        src_entity_column="customer_id",
+        dst_entity_table="products",
+        dst_entity_column="product_id",
+        eval_k=2,
+    )
+    positives = (LinkTaskRow(0, "c1", "p1", "2023-01-15", 1),)
+    rows = sample_negative_links(positives, ["p1", "p2"], num_negatives=1, seed=1)
+    bundle = RelationalDatasetBundle(schema, store.tables, rows, task)
+    prepared = prepare_link_experiment(
+        bundle,
+        rows,
+        LinkExperimentConfig(max_hops=1, sequence_max_len=4),
+    )
+    dataset = LinkRiftDataset(prepared)
+    src_model = RiftMambaModel(
+        prepared.src_coefficients.bases,
+        d_model=8,
+        output_dim=2,
+        event_dim=prepared.src_sequences.values.shape[-1],
+        num_temporal_routes=prepared.src_sequences.values.shape[1],
+        basis_layers=1,
+        sequence_layers=1,
+        use_mamba_ssm=False,
+    )
+    dst_model = RiftMambaModel(
+        prepared.dst_coefficients.bases,
+        d_model=8,
+        output_dim=2,
+        event_dim=prepared.dst_sequences.values.shape[-1],
+        num_temporal_routes=prepared.dst_sequences.values.shape[1],
+        basis_layers=1,
+        sequence_layers=1,
+        use_mamba_ssm=False,
+    )
+    pair_model = PairRiftMambaModel(src_model, dst_model)
+    batch = dataset[0]
+    score = pair_model(
+        batch["src_alpha"].unsqueeze(0),
+        batch["src_alpha_mask"].unsqueeze(0),
+        batch["dst_alpha"].unsqueeze(0),
+        batch["dst_alpha_mask"].unsqueeze(0),
+        batch["src_events"].unsqueeze(0),
+        batch["src_event_mask"].unsqueeze(0),
+        batch["dst_events"].unsqueeze(0),
+        batch["dst_event_mask"].unsqueeze(0),
+    )
+
+    assert len(rows) == 2
+    assert score.shape == (1,)
+    assert torch.isfinite(score).all()
 
 
 def test_sequence_builder_excludes_autocomplete_target_and_proxy_columns() -> None:
