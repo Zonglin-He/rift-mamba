@@ -22,10 +22,10 @@ RDB records
 - `records.py`: per-sample causal traversal. Every timestamped row on a path must satisfy `tau <= seed_time`; windows are applied after the full path event time is known.
 - `basis.py` and `coefficients.py`: basis generation and extraction for `b=(route,column,aggregation,window)`, plus path-conditional composite bases such as transaction price conditioned on product category.
 - `semantic.py`: injectable schema/value semantic encoder. The default is deterministic hash text encoding; `SentenceTransformerTextEncoder` is available through the optional `text` extra.
-- `layout.py`: stable `route x slot x channel` dense tensor layout for CNN/TCN-style feature extractors.
+- `layout.py`: stable `route x slot x channel` dense tensor layout for CNN/TCN-style ablations.
 - `sequences.py`: path-aware route event tokens. Tokens include feature values from every row on the route path, categorical/text embedding vectors, Fourier time features, hop count, and route semantics.
 - `sequence_preprocessing.py`: train-only event feature standardization for raw numeric and recency dimensions in the route-wise sequence branch.
-- `nn.py`: learnable synthesis `m alpha Psi + (1-m) Omega`, `basis_mode="sum"`, `basis_mode="mamba"`, `basis_mode="cnn"`, route-wise sequence encoder, and fusion head.
+- `nn.py`: learnable synthesis `m alpha Psi + (1-m) Omega`, modular basis extractors, route-wise sequence encoder, and fusion head.
 - `trainer.py`: minimal supervised training loop with optional TVE auxiliary cosine loss over `TaskVectorHead`.
 - `task.py`: `TaskSpec`, automatic target/proxy leakage exclusion helpers, and train-split proxy leakage audit. The same exclude set is applied to coefficient bases and sequence event tokens.
 - `pretraining.py`: TVE-style future task vector targets, null indicators, sample reweighting, and cosine loss that handles null-heavy targets.
@@ -48,9 +48,14 @@ Expected tests:
 
 ## Basis Branch Modes
 
-- `basis_mode="sum"` computes the literal inverse-style signal `sum_b e_b(q)`.
-- `basis_mode="mamba"` keeps all basis terms as ordered tokens, including missing-basis tokens.
-- `basis_mode="cnn"` scatters basis tokens into `[batch, routes, slots, channels]` and applies a CNN encoder.
+RIFT is extractor-agnostic: basis synthesis builds tokens `e_b(q)` and a modular encoder maps `{e_b(q), s_b}` to `h_basis`. The default is `basis_mode="route_set"` because it preserves route-level structure without assuming a 2D Euclidean layout.
+
+- `route_set` / `route_attention`: hierarchical route-set attention. This is the default basis branch.
+- `perceiver`: latent cross-attention for large basis sets.
+- `relattn` / `relational_attention` / `masked_basis_attention`: route/table/column/aggregation/window masked basis attention.
+- `bimamba`, `multiscan_mamba`, `route_mamba`, `mamba`: order-sensitive SSM variants for canonical, bidirectional, multi-order, or per-route scans.
+- `deepset`, `set_transformer`, `ft_transformer`, `mixer`, `basis_graph`, `tcn`, `sum`: non-CNN alternatives and ablations.
+- `cnn`: layout-dependent ablation that scatters tokens into `[batch, routes, slots, channels]`; it is no longer the default because local 2D adjacency is not guaranteed to be semantically meaningful for arbitrary relational bases.
 
 ## Leakage Rules
 

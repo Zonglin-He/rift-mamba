@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 from rift_mamba import (
     BasisConfig,
+    BASIS_MODES,
     AtomicRouteEnumerator,
     BasisLayout,
     CoefficientExtractor,
@@ -239,6 +240,36 @@ def test_sequence_builder_and_model_forward() -> None:
 
     assert logits.shape == (1, 2)
     assert torch.isfinite(logits).all()
+
+
+@pytest.mark.parametrize("basis_mode", sorted(BASIS_MODES))
+def test_all_basis_extractors_forward(basis_mode: str) -> None:
+    schema = make_schema()
+    store = make_store(schema)
+    routes = RouteEnumerator(schema, max_hops=1).enumerate("customers")
+    basis = build_basis(schema, routes, BasisConfig(windows=(None,)))
+    coeffs = CoefficientExtractor(store, basis).transform(
+        [TaskRow(0, "c1", "2023-01-15")],
+        target_table="customers",
+    )
+    model = RiftMambaModel(
+        bases=basis,
+        d_model=16,
+        output_dim=2,
+        basis_layers=1,
+        basis_mode=basis_mode,
+        use_mamba_ssm=False,
+    )
+    logits, features = model(
+        torch.from_numpy(coeffs.values).float(),
+        torch.from_numpy(coeffs.masks).bool(),
+        return_features=True,
+    )
+
+    assert logits.shape == (1, 2)
+    assert features.shape == (1, model.feature_dim)
+    assert torch.isfinite(logits).all()
+    assert torch.isfinite(features).all()
 
 
 def test_event_feature_standardizer_uses_train_sequence_statistics() -> None:

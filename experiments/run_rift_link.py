@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from experiments.common import load_relbench_bundle, write_json
 from rift_mamba import (
+    BASIS_MODES,
     LinkExperimentConfig,
     LinkRiftDataset,
     PairRiftMambaModel,
@@ -38,6 +39,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--negative-ratio", type=int, default=1)
+    parser.add_argument("--basis-mode", choices=sorted(BASIS_MODES), default="route_set")
     parser.add_argument("--output", default="experiments/results/rift_link.json")
     args = parser.parse_args()
 
@@ -62,7 +64,7 @@ def main() -> None:
         output_dim=2,
         event_dim=train.src_sequences.values.shape[-1],
         num_temporal_routes=train.src_sequences.values.shape[1],
-        basis_mode="cnn",
+        basis_mode=args.basis_mode,
     )
     dst_encoder = RiftMambaModel(
         train.dst_coefficients.bases,
@@ -70,7 +72,7 @@ def main() -> None:
         output_dim=2,
         event_dim=train.dst_sequences.values.shape[-1],
         num_temporal_routes=train.dst_sequences.values.shape[1],
-        basis_mode="cnn",
+        basis_mode=args.basis_mode,
     )
     model = PairRiftMambaModel(src_encoder, dst_encoder)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)

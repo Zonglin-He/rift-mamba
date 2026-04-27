@@ -20,7 +20,7 @@ from experiments.common import (
     supervised_loss,
     write_json,
 )
-from rift_mamba import ExperimentConfig, RiftDataset, RiftMambaModel, prepare_experiment
+from rift_mamba import BASIS_MODES, ExperimentConfig, RiftDataset, RiftMambaModel, prepare_experiment
 
 
 def main() -> None:
@@ -36,7 +36,7 @@ def main() -> None:
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--max-hops", type=int, default=3)
     parser.add_argument("--sequence-max-len", type=int, default=128)
-    parser.add_argument("--basis-mode", choices=["sum", "mamba", "cnn"], default="cnn")
+    parser.add_argument("--basis-mode", choices=sorted(BASIS_MODES), default="route_set")
     parser.add_argument("--output", default="experiments/results/rift.json")
     args = parser.parse_args()
 

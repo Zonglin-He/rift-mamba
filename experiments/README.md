@@ -12,6 +12,12 @@ python experiments/run_external_baseline.py --name relgt --dataset rel-f1 --task
 python experiments/summarize_results.py
 ```
 
+`run_rift.py` and `run_rift_link.py` default to `--basis-mode route_set`.
+Use `--basis-mode cnn` only as a layout-dependent ablation, or choose one of
+`perceiver`, `relattn`, `bimamba`, `multiscan_mamba`, `route_mamba`,
+`deepset`, `set_transformer`, `ft_transformer`, `mixer`, `basis_graph`, `tcn`,
+`mamba`, or `sum` for extractor ablations.
+
 External baselines are dispatched rather than reimplemented. Point `--command`
 at the official implementation entry point for GraphSAGE RDL, RelGNN, RelGT,
 RT, or Griffin; the script writes the shared dataset/task config and expects the
